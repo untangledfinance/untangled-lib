@@ -16,12 +16,14 @@ import {
 import { HttpError, NotFoundError } from '../error';
 import { isClass, profiles } from '../../types';
 import { Step } from '../../validation';
-import { Hono, Context, Env } from 'hono';
-import { cors } from 'hono/cors';
-import { createLogger } from '../../logging';
+import { Hono, Context } from 'hono';
 import { serve } from '@hono/node-server';
+import { createLogger } from '../../logging';
+import { HttpContext } from '../context';
 
 const logger = createLogger('hono');
+
+const RoutedSymbol = Symbol.for('__routed__');
 
 // Define Hono env type for body storage
 type HonoEnv = {
@@ -30,58 +32,59 @@ type HonoEnv = {
   };
 };
 
-class Mapper {
+class Helper {
   static toReq(c: Context<HonoEnv>): Req {
     const url = new URL(c.req.url);
-    // Get headers as an object
-    const headers: Record<string, string | string[]> = {};
-    for (const [key, value] of Object.entries(c.req.header())) {
-      headers[key] = value;
-    }
-    
+    const queryStringPosition = c.req.url.indexOf('?');
     return {
       method: c.req.method,
       path: url.pathname,
-      url: c.req.url,
-      headers,
+      headers: c.req.header(),
       query: Object.fromEntries(url.searchParams.entries()),
-      queryString: url.search,
+      queryString:
+        queryStringPosition >= 0 && c.req.url.slice(queryStringPosition),
       params: c.req.param(),
-      body: c.get('body'), // Body will be set via middleware
+      body: c.get('body'),
     } as Req;
   }
 
   static toRes(c: Context<HonoEnv>): Res {
     return {
-      status: 200, // Default status
+      status: StatusCode.OK,
       headers: {},
     } as Res;
   }
 
-  static corsOptions(options: Partial<CorsOptions>) {
-    return {
-      origin: options.allowedOrigins 
-        ? Array.isArray(options.allowedOrigins)
-          ? options.allowedOrigins
-          : [options.allowedOrigins]
-        : ['*'],
-      allowMethods: options.allowedMethods
-        ? Array.isArray(options.allowedMethods)
-          ? options.allowedMethods
-          : [options.allowedMethods]
-        : ['*'],
-      allowHeaders: options.allowedHeaders
-        ? Array.isArray(options.allowedHeaders)
-          ? options.allowedHeaders
-          : [options.allowedHeaders]
-        : ['*'],
-      maxAge: options.maxAge ? Number(options.maxAge) : 5,
+  static corsHandler(options: Partial<CorsOptions> = {}) {
+    return async (c: Context<HonoEnv>, next: () => Promise<void>) => {
+      const { allowedOrigins, allowedHeaders, allowedMethods, maxAge } =
+        options;
+      if (c.req.method === 'OPTIONS') {
+        allowedOrigins &&
+          c.header(
+            'Access-Control-Allow-Origin',
+            [allowedOrigins].flat().join(',')
+          );
+        allowedHeaders &&
+          c.header(
+            'Access-Control-Allow-Headers',
+            [allowedHeaders].flat().join(',')
+          );
+        allowedMethods &&
+          c.header(
+            'Access-Control-Allow-Methods',
+            [allowedMethods].flat().join(',')
+          );
+        c.header('Access-Control-Max-Age', (maxAge ?? '5').toString());
+        return c.body(null, StatusCode.NoContent);
+      }
+      await next();
     };
   }
 }
 
 export abstract class Group implements Router {
-  protected honoApp?: Hono<HonoEnv>;
+  protected router?: Hono<HonoEnv>;
   protected corsOptions?: Partial<CorsOptions>;
   protected errorHandler?: (err: Error, req: Req) => Promise<Res>;
   private eventHandlers: Map<string, Function[]> = new Map();
@@ -111,30 +114,37 @@ export abstract class Group implements Router {
   /**
    * Tries sending the {@link Res}.
    */
-  protected send(c: Context<HonoEnv>, { data, status, headers }: Res): Response {
-    // Set headers
-    if (headers) {
-      for (const [key, value] of Object.entries(headers)) {
+  protected send(c: Context<HonoEnv>, response: Res | Response) {
+    if (!(c as any)[RoutedSymbol]) {
+      (c as any)[RoutedSymbol] = true;
+      if (response instanceof Response) {
+        response.headers.forEach((value, key) => {
+          if (key.toLowerCase() !== 'content-encoding') {
+            c.header(key, value);
+          }
+        });
+        c.status(response.status as any);
+        // For now, convert Response to json - could be improved later
+        return c.json({ data: 'Response object not fully supported yet' });
+      }
+      const { data, status, headers } = response;
+      for (const key of Object.keys(headers ?? {})) {
+        const value = headers[key];
         c.header(key, Array.isArray(value) ? value.join(',') : String(value));
       }
+      c.status((status ?? StatusCode.OK) as any);
+      if (data !== undefined) {
+        return c.json(data);
+      }
+      return c.body(null);
     }
-
-    // Set status
-    c.status((status ?? StatusCode.OK) as any);
-
-    // Return response with data
-    if (data !== undefined) {
-      return c.json(data);
-    }
-    return c.body(null);
   }
 
   apply({ routes, fetcher, error }: Partial<RouteOptions>) {
-    this.honoApp = new Hono<HonoEnv>();
-    this.errorHandler = error;
-
-    // Add middleware to parse body
-    this.honoApp.use('*', async (c, next) => {
+    this.router = new Hono<HonoEnv>();
+    
+    // Add middleware to parse JSON body
+    this.router.use('*', async (c, next) => {
       try {
         const contentType = c.req.header('content-type');
         if (contentType?.includes('application/json')) {
@@ -152,41 +162,28 @@ export abstract class Group implements Router {
 
     if (routes?.length && fetcher) {
       for (const route of routes) {
-        const fetch = fetcher.bind(this)(route);
-        const method = route.method.toLowerCase();
-        const path = route.path;
-
+        const fetch = fetcher.bind(this)(route) as (
+          req: Req,
+          res: Res
+        ) => Promise<Res | Response>;
         const handler = async (c: Context<HonoEnv>) => {
-          try {
-            const req = Mapper.toReq(c);
-            const res = Mapper.toRes(c);
-            const result = await fetch(req, res);
-            return this.send(c, result);
-          } catch (err) {
-            if (!(err instanceof HttpError)) {
-              logger.error(`${err.message}\n`, err);
-            }
-            const req = Mapper.toReq(c);
-            const errorRes = await this.errorHandler(err, req);
-            return this.send(c, errorRes);
-          }
+          return this.send(c, await fetch(Helper.toReq(c), Helper.toRes(c)));
         };
-
-        if (method === '*') {
-          this.honoApp.all(path, handler);
-        } else {
-          this.honoApp.on(method.toUpperCase(), path, handler);
+        const method = route.method;
+        if (method) {
+          if (method === '*') {
+            this.router.all(route.path, handler);
+          } else {
+            this.router[method.toLowerCase()](route.path, handler);
+          }
         }
       }
-    }
-
-    if (error) {
       this.errorHandler = error;
     }
-
     return this;
   }
 
+  @Step(0)
   cors(options: Partial<CorsOptions> | '*') {
     if (options === '*') {
       this.corsOptions = {
@@ -200,31 +197,25 @@ export abstract class Group implements Router {
     return this;
   }
 
+  @Step(2)
   _route(method: HttpMethod, path: string, handler: Handler) {
-    !this.honoApp && this.configure();
-
+    !this.router && this.configure();
     const honoHandler = async (c: Context<HonoEnv>) => {
       try {
-        const req = Mapper.toReq(c);
-        const res = Mapper.toRes(c);
-        const result = await handler(req, res);
-        return this.send(c, result);
+        return this.send(c, await handler(Helper.toReq(c), Helper.toRes(c)));
       } catch (err) {
         if (!(err instanceof HttpError)) {
           logger.error(`${err.message}\n`, err);
         }
-        const req = Mapper.toReq(c);
-        const errorRes = await this.errorHandler(err, req);
-        return this.send(c, errorRes);
+        return this.send(c, await this.errorHandler(err, Helper.toReq(c)));
       }
     };
-
+    
     if (method === '*') {
-      this.honoApp.all(path, honoHandler);
+      this.router.all(path, honoHandler);
     } else {
-      this.honoApp.on(method, path, honoHandler);
+      this.router[method.toLowerCase()](path, honoHandler);
     }
-
     return this;
   }
 
@@ -269,22 +260,23 @@ export abstract class Group implements Router {
 
   @Step(2)
   _use(prefix: string, ...args: [...Filter[], Class<Group>, ...any]) {
-    !this.honoApp && this.configure();
+    !this.router && this.configure();
     const filters: Filter[] = [];
     for (let i = 0; i < args.length; i++) {
       if (isClass(args[i])) {
         const group = args[i] as Class<Group>;
         const groupArgs = args.slice(i + 1);
         const g = new (class extends group {})(...groupArgs) as Group;
-        !g.honoApp &&
+        !g.router &&
           g.configure(
             ...(this.filters.get('*') ?? []),
             ...filters,
             ...(this.filters.get(group) ?? [])
           );
-        
-        // Mount the sub-application
-        this.honoApp.route(prefix, g.honoApp);
+        this.router.route(prefix, g.router);
+        if (g.corsOptions) {
+          this.router.options(prefix + '*', Helper.corsHandler(g.corsOptions));
+        }
         break;
       }
       filters.push(args[i] as Filter);
@@ -329,58 +321,54 @@ export abstract class Application extends Group implements Server {
   private server?: any;
 
   async start({ host, port }: Partial<ServeOptions>) {
-    !this.honoApp && configure(this);
-
+    !this.router && configure(this);
     if (this.server) {
       throw new Error('Already served!');
     }
-
     this.emit('start');
-
-    // Setup CORS if configured
-    if (this.corsOptions) {
-      this.honoApp.use('*', cors(Mapper.corsOptions(this.corsOptions)));
-    }
-
-    // Request event middleware
-    this.honoApp.use('*', async (c, next) => {
-      this.emit('request', Mapper.toReq(c));
-      await next();
-      this.emit('response', Mapper.toReq(c), Mapper.toRes(c));
-    });
-
-    // Not found handler
-    this.honoApp.notFound(async (c) => {
-      if (this.errorHandler) {
-        const req = Mapper.toReq(c);
-        const res = await this.errorHandler(new NotFoundError(), req);
-        return this.send(c, res);
-      } else {
-        c.status(404);
-        return c.json({ error: 'Not Found' });
-      }
-    });
-
-    // Error handler
-    this.honoApp.onError(async (err, c) => {
-      if (!(err instanceof HttpError)) {
-        logger.error(`${err.message}\n`, err);
-      }
-
-      if (this.errorHandler) {
-        const req = Mapper.toReq(c);
-        const res = await this.errorHandler(err, req);
-        return this.send(c, res);
-      } else {
-        c.status(500);
-        return c.json({ error: 'Internal Server Error' });
-      }
-    });
+    
+    const app = new Hono<HonoEnv>()
+      .use('*', Helper.corsHandler(this.corsOptions))
+      .use('*', async (c, next) => {
+        // Parse JSON body
+        try {
+          const contentType = c.req.header('content-type');
+          if (contentType?.includes('application/json')) {
+            const body = await c.req.json();
+            c.set('body', body);
+          } else if (contentType?.includes('application/x-www-form-urlencoded')) {
+            const body = await c.req.parseBody();
+            c.set('body', body);
+          }
+        } catch (err) {
+          // Body parsing failed, continue without body
+        }
+        await next();
+      })
+      .use('*', async (c, next) => {
+        const request = Helper.toReq(c);
+        HttpContext.set({ req: request });
+        this.emit('request', request);
+        await next();
+      })
+      .route('/', this.router)
+      .all('*', async (c) => {
+        const { req } = HttpContext.get();
+        if (this.errorHandler) {
+          return this.send(c, await this.errorHandler(new NotFoundError(), req));
+        } else {
+          c.status(404);
+          return c.json({ error: 'Not Found' });
+        }
+      })
+      .use('*', async (c, next) => {
+        this.emit('response', Helper.toReq(c), Helper.toRes(c));
+        await next();
+      });
 
     try {
-      // Start the server using @hono/node-server
       this.server = serve({
-        fetch: this.honoApp.fetch,
+        fetch: app.fetch,
         port: port || 3000,
         hostname: host || '0.0.0.0',
       });
@@ -411,8 +399,8 @@ export abstract class Application extends Group implements Server {
         this.server.close();
       }
       this.server = undefined;
-      this.emit('stopped');
     }
+    this.emit('stopped');
   }
 
   override on(event: ServerEvent, handler: Function) {
